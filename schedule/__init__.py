@@ -201,17 +201,20 @@ class Scheduler:
                  :meth:`next_run <Scheduler.next_run>`
                  or None if no jobs are scheduled
         """
-        if not self.next_run:
+        # Reading the next_run property copies and rescans the whole job list, and
+        # this property is polled in the scheduler's sleep loop, so read it once.
+        next_run = self.next_run
+        if not next_run:
             return None
         now = datetime.datetime.now()
         if min(self.jobs).at_time_zone is None:
-            return (self.next_run - now).total_seconds()
+            return (next_run - now).total_seconds()
         # The earliest job is timezone-aware, so its naive local next_run may
         # fall inside a repeated (ambiguous) local hour left behind by a
         # backwards clock change. Subtracting naive wall-clock readings would be
         # off by the size of the transition, so resolve both sides to absolute
         # instants first - astimezone() honours the fold flag.
-        return (self.next_run.astimezone() - now.astimezone()).total_seconds()
+        return (next_run.astimezone() - now.astimezone()).total_seconds()
 
 
 class Job:
