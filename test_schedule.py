@@ -1441,8 +1441,13 @@ class SchedulerTests(TestCase):
             assert schedule.idle_seconds() == 50.0
         with mock_datetime(2025, 10, 26, 2, 0, 10, TZ_MADRID, fold=1):
             # Current Madrid time:  02:00:10 (UTC +01:00, second pass)
-            # Twenty seconds of real time remain, even though the naive
-            # wall-clock difference reads an hour and twenty seconds.
+            # The corrected next_run of 02:00:30 is twenty seconds away, and both
+            # arithmetics agree on that: fold is inert under subtraction, so
+            # stamping it leaves an ordinary in-fold reading undisturbed. The
+            # hour-long error was never in the subtraction - it came from the
+            # unfixed scheduler retaining next_run == 03:00:30, which reported
+            # 3620.0 here instead of 20.0 and would have made the documented
+            # sleep-exactly loop wait out the whole repeated hour.
             assert schedule.idle_seconds() == 20.0
 
     def test_timezone_chaining_order_insensitive(self):
