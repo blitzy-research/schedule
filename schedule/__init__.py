@@ -203,7 +203,15 @@ class Scheduler:
         """
         if not self.next_run:
             return None
-        return (self.next_run - datetime.datetime.now()).total_seconds()
+        now = datetime.datetime.now()
+        if min(self.jobs).at_time_zone is None:
+            return (self.next_run - now).total_seconds()
+        # The earliest job is timezone-aware, so its naive local next_run may
+        # fall inside a repeated (ambiguous) local hour left behind by a
+        # backwards clock change. Subtracting naive wall-clock readings would be
+        # off by the size of the transition, so resolve both sides to absolute
+        # instants first - astimezone() honours the fold flag.
+        return (self.next_run.astimezone() - now.astimezone()).total_seconds()
 
 
 class Job:
@@ -235,7 +243,8 @@ class Job:
         # optional time at which this job runs
         self.at_time: Optional[datetime.time] = None
 
-        # optional time zone of the self.at_time field. Only relevant when at_time is not None
+        # optional time zone in which this job's schedule is expressed.
+        # Set by at() or by timezone(); independent of whether at_time is set.
         self.at_time_zone = None
 
         # datetime of the last run
@@ -496,16 +505,7 @@ class Job:
             )
 
         if tz is not None:
-            import pytz
-
-            if isinstance(tz, str):
-                self.at_time_zone = pytz.timezone(tz)  # type: ignore
-            elif isinstance(tz, pytz.BaseTzInfo):
-                self.at_time_zone = tz
-            else:
-                raise ScheduleValueError(
-                    "Timezone must be string or pytz.timezone object"
-                )
+            self.at_time_zone = self._decode_timezone(tz)
 
         if not isinstance(time_str, str):
             raise TypeError("at() should be passed a string")
@@ -557,6 +557,34 @@ class Job:
         second = int(second)
         self.at_time = datetime.time(hour, minute, second)
         return self
+
+    def timezone(self, tz: str):
+        """
+        Specify the timezone this job's schedule is expressed in.
+        Chainable in any order and independent of at().
+
+        This is the timezone entry point for jobs that cannot use at(): a
+        seconds-unit job has no valid anchor string to pass at(), and would
+        otherwise be unable to take clock changes into account at all.
+
+        :param tz: The timezone that this job's schedule refers to. Can be
+            a string that can be parsed by pytz.timezone(), or a pytz.BaseTzInfo object
+
+        :return: The invoked job instance
+        """
+        self.at_time_zone = self._decode_timezone(tz)
+        return self
+
+    def _decode_timezone(self, tz: str):
+        # pytz is imported here, on a path only reached when a caller explicitly
+        # asks for a timezone, so that it remains an optional dependency.
+        import pytz
+
+        if isinstance(tz, str):
+            return pytz.timezone(tz)
+        if isinstance(tz, pytz.BaseTzInfo):
+            return tz
+        raise ScheduleValueError("Timezone must be string or pytz.timezone object")
 
     def to(self, latest: int):
         """
@@ -669,7 +697,14 @@ class Job:
         :return: ``True`` if the job should be run now.
         """
         assert self.next_run is not None, "must run _schedule_next_run before"
-        return datetime.datetime.now() >= self.next_run
+        if self.at_time_zone is None:
+            return datetime.datetime.now() >= self.next_run
+        # A timezone-aware job's next_run may sit inside a repeated (ambiguous)
+        # local hour left behind by a backwards clock change. Naive comparison
+        # cannot tell the first pass from the second, so resolve both moments to
+        # absolute instants - astimezone() honours the fold flag - before
+        # comparing them.
+        return datetime.datetime.now().astimezone() >= self.next_run.astimezone()
 
     def run(self):
         """
@@ -733,8 +768,12 @@ class Job:
         while next_run <= now:
             next_run += period
 
+        # Only fixate the wall-clock time when the at_time anchors the hour. Doing
+        # it for a sub-daily job displaces next_run by the size of a backwards clock
+        # change, freezing the job for the whole of the repeated local hour.
         next_run = self._correct_utc_offset(
-            next_run, fixate_time=(self.at_time is not None)
+            next_run,
+            fixate_time=(self.at_time is not None and self._at_time_fixates_hour()),
         )
 
         # To keep the api consistent with older versions, we have to set the 'next_run' to a naive timestamp in the local timezone.
@@ -743,7 +782,15 @@ class Job:
             # Convert back to the local timezone
             next_run = next_run.astimezone()
 
+            # Stripping the tzinfo below throws away the only thing that tells the
+            # two passes through a repeated (ambiguous) local hour apart. Record the
+            # true offset first, then stamp fold=1 when re-interpreting the naive
+            # value would resolve to the other pass. Strict no-op outside a fold;
+            # PEP 495 keeps fold invisible to comparison and subtraction.
+            offset = next_run.utcoffset()
             next_run = next_run.replace(tzinfo=None)
+            if next_run.astimezone().utcoffset() != offset:
+                next_run = next_run.replace(fold=1)
 
         self.next_run = next_run
 
@@ -766,9 +813,23 @@ class Job:
 
         # When we set the time elements, we might end up in a different UTC-offset than the current offset.
         # This happens when we cross into or out of daylight saving time.
-        moment = self._correct_utc_offset(moment, fixate_time=True)
+        # Only fixate the wall-clock time when the at_time anchors the hour.
+        moment = self._correct_utc_offset(
+            moment, fixate_time=self._at_time_fixates_hour()
+        )
 
         return moment
+
+    def _at_time_fixates_hour(self) -> bool:
+        """
+        Whether this job's at_time anchors the hour-of-day component.
+        Only daily and weekly jobs do; for sub-daily units the hour is free.
+
+        Mirrors the condition under which _move_to_at_time replaces the hour.
+        Preserving the hour across a backwards clock change discards the correct
+        instant normalize() produced and pushes next_run past the repeated hour.
+        """
+        return self.unit == "days" or self.start_day is not None
 
     def _correct_utc_offset(
         self, moment: datetime.datetime, fixate_time: bool
