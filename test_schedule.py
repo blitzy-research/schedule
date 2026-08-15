@@ -1246,15 +1246,10 @@ class SchedulerTests(TestCase):
 
     def test_tz_minutes_dst_overlap_hour_first_pass(self):
         mock_job = self.make_tz_mock_job()
-        # The unpatched datetime class, captured before mock_datetime swaps the
-        # attribute for its double, so the return-value contract below is checked
-        # against an ordinary datetime rather than against the test harness.
+        # The unpatched datetime class, for the type assertions below
         real_datetime = datetime.datetime
         # On 26 October 2025 the Madrid clock moves from 03:00 back to 02:00, so
-        # the local hour 02:00:00-02:59:59 happens twice and two hours of real
-        # time pass between the first 02:00:00 and 03:00:00. A minutely job only
-        # anchors the second, never the hour, so it must keep its cadence inside
-        # the repeated hour instead of jumping over the whole of it.
+        # local 02:00-02:59 occurs twice; a minutely job anchors only the second.
         with mock_datetime(2025, 10, 26, 2, 58, 40, TZ_MADRID, fold=0):
             # Current Madrid time:  02:58:40 (UTC +02:00, first pass)
             # Expected next run:    02:59:30 (UTC +02:00, first pass)
@@ -1264,24 +1259,16 @@ class SchedulerTests(TestCase):
             assert job.next_run.second == 30
         with mock_datetime(2025, 10, 26, 2, 59, 40, TZ_MADRID, fold=0):
             # Current Madrid time:  02:59:40 (UTC +02:00, first pass)
-            # One minute later the clock has fallen back, so the next run is the
-            # second pass of 02:00:30 (UTC +01:00) - fifty seconds away. Landing
-            # on 03:00:30 instead would freeze the job for the whole hour.
+            # Expected next run:    02:00:30 (UTC +01:00, second pass), fifty
+            # seconds away though its wall clock reads earlier; fold marks it
             job.run()
             assert job.next_run.day == 26
             assert job.next_run.hour == 2
             assert job.next_run.minute == 0
             assert job.next_run.second == 30
-            # fold is the only channel that tells the second pass from the first
-            # once the value has been handed back as a naive local datetime.
             assert job.next_run.fold == 1
-            # The public contract on these two fields is frozen, and stamping
-            # fold must not have quietly widened it: both stay naive datetimes in
-            # Python's local timezone, they subtract to a timedelta, and they
-            # compare with a plain local datetime. PEP 495 keeps fold invisible
-            # to all of that, which is what makes carrying it here safe. Handing
-            # back aware datetimes would satisfy the field assertions above while
-            # breaking every caller that does this arithmetic.
+            # Both fields stay naive local datetimes that subtract to a timedelta
+            # and compare with a plain one; PEP 495 keeps fold out of that
             assert isinstance(job.next_run, real_datetime)
             assert isinstance(job.last_run, real_datetime)
             assert job.next_run.tzinfo is None
@@ -1295,16 +1282,13 @@ class SchedulerTests(TestCase):
 
     def test_tz_minutes_dst_overlap_hour_second_pass(self):
         mock_job = self.make_tz_mock_job()
-        # The same job as the first-pass test, but running after the clock has
-        # already fallen back. The two passes are different moments in real time
-        # and must therefore produce different results.
+        # The same job run on the second pass of the repeated hour: an hour later
+        # in real time than the first pass, so it lands past the fold.
         with mock_datetime(2025, 10, 26, 2, 58, 40, TZ_MADRID, fold=0):
             job = every().minute.at(":30", "Europe/Madrid").do(mock_job)
         with mock_datetime(2025, 10, 26, 2, 59, 40, TZ_MADRID, fold=1):
             # Current Madrid time:  02:59:40 (UTC +01:00, second pass)
-            # The repeated hour has genuinely elapsed by now, so the next run
-            # leaves it behind.
-            # Expected next run:    03:00:30 (UTC +01:00)
+            # Expected next run:    03:00:30 (UTC +01:00), past the repeated hour
             job.run()
             assert job.next_run.day == 26
             assert job.next_run.hour == 3
@@ -1313,10 +1297,8 @@ class SchedulerTests(TestCase):
 
     def test_tz_hours_dst_overlap_hour(self):
         mock_job = self.make_tz_mock_job()
-        # An hourly job anchors minute and second but never the hour, so it must
-        # fire in both passes of the repeated Madrid hour. Both runs below read
-        # the identical wall clock and must still disagree, because they are an
-        # hour apart in real time.
+        # An hourly job anchors minute and second but never the hour, so it fires
+        # in both passes of the repeated Madrid hour.
         with mock_datetime(2025, 10, 26, 1, 30, 0, TZ_MADRID, fold=0):
             # Current Madrid time:  01:30:00 (UTC +02:00)
             # Expected next run:    02:30:00 (UTC +02:00, first pass)
@@ -1325,52 +1307,38 @@ class SchedulerTests(TestCase):
             assert job.next_run.minute == 30
             assert job.next_run.second == 0
             assert job.next_run.fold == 0
-            # A DAILY at_time, by contrast, does anchor the hour, and its
-            # published behaviour on this transition is to run only at the FIRST
-            # 02:30 and then the next day. That contract survives only because
-            # the hour-anchoring predicate keeps daily jobs on the old code path,
-            # so pin the occurrence itself and not just the wall clock: the
-            # forbidden second occurrence reads 02:30 too, and would be
-            # distinguishable only by carrying fold 1.
+            # A daily at_time anchors the hour instead: such a job runs at the
+            # first 02:30 only, then the next day, and fold pins which one it is.
             daily = every().day.at("02:30", "Europe/Madrid").do(mock_job)
             assert daily.next_run.day == 26
             assert daily.next_run.hour == 2
             assert daily.next_run.minute == 30
             assert daily.next_run.fold == 0
         with mock_datetime(2025, 10, 26, 2, 30, 5, TZ_MADRID, fold=0):
-            # Current Madrid time:  02:30:05 (UTC +02:00, first pass)
-            # The daily job is due here, five seconds into the first pass. Had it
-            # been scheduled for the second occurrence it would still be an hour
-            # away in real time, and this assertion would fail.
+            # Due five seconds into the first pass; the second occurrence of 02:30
+            # would still be an hour away.
             assert daily.should_run is True
         with mock_datetime(2025, 10, 26, 2, 59, 40, TZ_MADRID, fold=0):
             # Current Madrid time:  02:59:40 (UTC +02:00, first pass)
-            # Expected next run:    02:30:00 (UTC +01:00, second pass)
+            # Expected next run:    02:30:00 (UTC +01:00), the second pass of it
+            # being the only reading of 02:30 still in the future
             job.run()
             assert job.next_run.hour == 2
             assert job.next_run.minute == 30
-            # 02:30 has already gone by once, so the only reading of this value
-            # that is still in the future is the second pass. Without the fold
-            # stamp the wall clock alone cannot say which of the two it is, and a
-            # conversion that returned the already-past first occurrence would
-            # pass the two assertions above.
             assert job.next_run.fold == 1
         with mock_datetime(2025, 10, 26, 2, 59, 40, TZ_MADRID, fold=1):
             # Current Madrid time:  02:59:40 (UTC +01:00, second pass)
-            # Expected next run:    03:30:00 (UTC +01:00)
+            # Expected next run:    03:30:00 (UTC +01:00), unambiguous and so
+            # left unstamped
             job.run()
             assert job.next_run.hour == 3
             assert job.next_run.minute == 30
-            # 03:30 happens once, so this reading is unambiguous and must not be
-            # stamped: the fold guard is a strict no-op outside a repeated hour.
             assert job.next_run.fold == 0
 
     def test_tz_seconds_dst_overlap_hour(self):
         mock_job = self.make_tz_mock_job()
-        # A seconds-unit job has no anchor-string grammar, so it has nothing
-        # valid to hand at() and this configuration could not be expressed at
-        # all before the chainable timezone() method existed: at()'s unit guard
-        # rejects `seconds` before it ever looks at the timezone argument.
+        # A seconds-unit job has no anchor-string grammar and so nothing valid to
+        # hand at(), which rejects the unit outright; timezone() carries its zone.
         with mock_datetime(2025, 10, 26, 2, 59, 52, TZ_MADRID, fold=0):
             # Current Madrid time:  02:59:52 (UTC +02:00, first pass)
             # Expected next run:    02:59:57 (UTC +02:00, first pass)
@@ -1379,9 +1347,8 @@ class SchedulerTests(TestCase):
             assert job.next_run.minute == 59
             assert job.next_run.second == 57
         with mock_datetime(2025, 10, 26, 2, 59, 59, TZ_MADRID, fold=0):
-            # Current Madrid time:  02:59:59 (UTC +02:00) - the very last instant
-            # before the clock falls back. Five seconds later is the second pass
-            # of 02:00:04 (UTC +01:00), not 03:00:04.
+            # Current Madrid time:  02:59:59 (UTC +02:00), last instant of pass one
+            # Expected next run:    02:00:04 (UTC +01:00, second pass)
             job.run()
             assert job.next_run.day == 26
             assert job.next_run.hour == 2
@@ -1391,16 +1358,10 @@ class SchedulerTests(TestCase):
 
     def test_tz_minutes_dst_overlap_hour_keeps_cadence(self):
         mock_job = self.make_tz_mock_job()
-        # The cadence requirement: a minutely job must fire sixty times in each
-        # of the two passes through the repeated Madrid hour, 120 in total.
-        #
-        # The walk below is deliberately continuous - every minute of the first
-        # pass (fold=0) before every minute of the second pass (fold=1). Creating
-        # the job and then pinning fold=1 for the whole hour would teleport the
-        # clock over the entire first pass, leave the job overdue and report 61
-        # firings: one catch-up run under the missed-run policy, which skips
-        # rather than backfills overdue runs, plus sixty scheduled ones. That
-        # number is a harness artifact, so do not "simplify" this walk into it.
+        # A minutely job fires sixty times in each pass of the repeated Madrid
+        # hour, 120 in total. The walk is continuous - every minute of the first
+        # pass (fold=0) before every minute of the second (fold=1) - because
+        # jumping into the second pass leaves the job overdue and adds a run.
         with mock_datetime(2025, 10, 26, 1, 59, 40, TZ_MADRID, fold=0):
             # Current Madrid time:  01:59:40 (UTC +02:00), before the fold
             # Expected next run:    02:00:30 (UTC +02:00, first pass)
@@ -1410,61 +1371,49 @@ class SchedulerTests(TestCase):
         for minute in range(60):
             with mock_datetime(2025, 10, 26, 2, minute, 35, TZ_MADRID, fold=0):
                 schedule.run_pending()
-        # First pass of 02:00-02:59 (UTC +02:00): sixty slots, sixty runs.
+        # First pass of 02:00-02:59 (UTC +02:00): sixty slots, sixty runs
         assert mock_job.call_count == 60
         with mock_datetime(2025, 10, 26, 2, 59, 40, TZ_MADRID, fold=0):
-            # Still the FIRST pass, and next_run is now the second pass of
-            # 02:00:30: an instant fifty seconds in the future whose naive wall
-            # clock nevertheless reads fifty-nine minutes in the past. The
-            # due-check has to answer the real-time question, so poll it here
-            # explicitly - the sixty slots above are due either way and cannot
-            # tell an instant comparison from a wall-clock one.
+            # Still the first pass, while next_run is the second pass of 02:00:30:
+            # fifty seconds ahead in real time, fifty-nine minutes behind on the
+            # wall clock, and the due-check answers the former.
             assert job.should_run is False
             schedule.run_pending()
-        # A wall-clock due-check would have burned a run here.
         assert mock_job.call_count == 60
         with mock_datetime(2025, 10, 26, 2, 0, 30, TZ_MADRID, fold=1):
-            # The very same wall-clock reading in the SECOND pass is due, which is
-            # the other half of the same question.
+            # That same wall-clock reading in the second pass is due
             assert job.should_run is True
         for minute in range(60):
             with mock_datetime(2025, 10, 26, 2, minute, 35, TZ_MADRID, fold=1):
                 schedule.run_pending()
-        # Second pass of 02:00-02:59 (UTC +01:00): sixty more, no lost hour.
+        # Second pass of 02:00-02:59 (UTC +01:00): sixty more, no lost hour
         assert mock_job.call_count == 120
-        # Only now that the repeated hour has genuinely elapsed in real time does
-        # next_run advance past it.
+        # next_run advances past the repeated hour only once it has elapsed
         assert job.next_run.hour == 3
         assert job.next_run.minute == 0
         assert job.next_run.second == 30
 
     def test_tz_minutes_dst_overlap_hour_foreign_job_zone(self):
         mock_job = self.make_tz_mock_job()
-        # Here the process clock runs in UTC, which never folds, while the job's
-        # own zone does. A naive local UTC reading is therefore never ambiguous,
-        # so this case needs the unit-granularity gating but not the fold stamp -
-        # proof that the two halves of the fix address genuinely different
-        # sub-cases rather than being two spellings of the same one.
+        # The process clock runs in UTC, which never folds, while the job's own
+        # zone does. A naive local UTC reading is therefore never ambiguous, so no
+        # fold stamp applies and only the job zone's own arithmetic decides this.
         with mock_datetime(2025, 10, 26, 0, 59, 40, TZ_UTC, fold=0):
             # Current UTC time:     00:59:40
             # Current Madrid time:  02:59:40 (UTC +02:00, first pass)
-            # Expected Madrid run:  02:00:30 (UTC +01:00, second pass)
-            # Expected next run:    01:00:30 UTC - fifty seconds away, rather
-            # than the hour and fifty seconds that 02:00:30 UTC would be.
+            # Expected next run:    01:00:30 UTC = Madrid 02:00:30, second pass
             job = every().minute.at(":30", "Europe/Madrid").do(mock_job)
             assert job.next_run.day == 26
             assert job.next_run.hour == 1
             assert job.next_run.minute == 0
             assert job.next_run.second == 30
-            # No fold stamp: 01:00:30 UTC is an unambiguous local reading.
             assert job.next_run.fold == 0
 
     def test_tz_minutes_dst_overlap_half_hour(self):
         mock_job = self.make_tz_mock_job()
-        # Lord Howe falls back by only THIRTY minutes on 6 April 2025 - 02:00
-        # becomes 01:30, so the repeated local interval is 01:30:00-01:59:59 and
-        # the offset goes from +11:00 to +10:30. Nothing may be hardcoded to a
-        # one-hour transition.
+        # Lord Howe falls back by thirty minutes on 6 April 2025 - 02:00 becomes
+        # 01:30 and the offset goes from +11:00 to +10:30, so the repeated
+        # interval is 01:30-01:59 and nothing here is tied to a one-hour step.
         with mock_datetime(2025, 4, 6, 1, 58, 40, TZ_LORD_HOWE, fold=0):
             # Current Lord Howe time: 01:58:40 (UTC +11:00, first pass)
             # Expected next run:      01:59:30 (UTC +11:00, first pass)
@@ -1474,8 +1423,8 @@ class SchedulerTests(TestCase):
             assert job.next_run.second == 30
         with mock_datetime(2025, 4, 6, 1, 59, 40, TZ_LORD_HOWE, fold=0):
             # Current Lord Howe time: 01:59:40 (UTC +11:00, first pass)
-            # Expected next run:      01:30:30 (UTC +10:30, second pass) - the
-            # wall clock goes backwards by half an hour, fifty seconds ahead.
+            # Expected next run:      01:30:30 (UTC +10:30, second pass), fifty
+            # seconds ahead with the wall clock half an hour back
             job.run()
             assert job.next_run.day == 6
             assert job.next_run.hour == 1
@@ -1492,8 +1441,9 @@ class SchedulerTests(TestCase):
 
     def test_tz_minutes_dst_overlap_hour_idle_seconds(self):
         mock_job = self.make_tz_mock_job()
-        # idle_seconds() must report real time until the next run, not the naive
-        # wall-clock difference, while next_run sits inside the repeated hour.
+        # When next_run and the current moment fall in different passes of the
+        # repeated hour, their naive wall-clock difference is wrong by the
+        # transition size, so idle_seconds() reports the real time remaining.
         schedule.clear()
         with mock_datetime(2025, 10, 26, 2, 58, 40, TZ_MADRID, fold=0):
             job = every().minute.at(":30", "Europe/Madrid").do(mock_job)
@@ -1505,22 +1455,13 @@ class SchedulerTests(TestCase):
             assert schedule.idle_seconds() == 50.0
         with mock_datetime(2025, 10, 26, 2, 0, 10, TZ_MADRID, fold=1):
             # Current Madrid time:  02:00:10 (UTC +01:00, second pass)
-            # The corrected next_run of 02:00:30 is twenty seconds away, and both
-            # arithmetics agree on that: fold is inert under subtraction, so
-            # stamping it leaves an ordinary in-fold reading undisturbed. The
-            # hour-long error was never in the subtraction - it came from the
-            # unfixed scheduler retaining next_run == 03:00:30, which reported
-            # 3620.0 here instead of 20.0 and would have made the documented
-            # sleep-exactly loop wait out the whole repeated hour.
+            # Both readings sit in the second pass, twenty seconds apart, and fold
+            # is inert under subtraction, so it leaves this pair undisturbed.
             assert schedule.idle_seconds() == 20.0
         with mock_datetime(2025, 10, 26, 2, 0, 40, TZ_MADRID, fold=1):
-            # Current Madrid time:  02:00:40 (UTC +01:00, second pass)
-            # Ten seconds past the scheduled 02:00:30 and the job has not run
-            # again, so it is overdue. docs/examples.rst makes a NEGATIVE return
-            # contractual for that state - the documented sleep-exactly loop
-            # guards with n > 0 rather than expecting a distance - so the
-            # timezone-aware branch must report -10.0 and neither clamp it to
-            # zero nor hand back its absolute value.
+            # Ten seconds past the scheduled 02:00:30 without another run, so the
+            # job is overdue: docs/examples.rst makes a negative return
+            # contractual there, neither clamped to zero nor made absolute.
             assert schedule.idle_seconds() == -10.0
 
     def test_timezone_chaining_order_insensitive(self):
@@ -1528,27 +1469,21 @@ class SchedulerTests(TestCase):
         import pytz
 
         tz = pytz.timezone("Europe/Madrid")
-        # A configuration method must hand back the very job it was called on, not
-        # a configured clone: everything chained after it would otherwise be
-        # applied to a different object, and .do() would register that other one.
-        # every(5).seconds registers nothing on its own - only do() appends to the
-        # scheduler - so this builder cannot disturb the pairs compared below.
+        # A configuration method hands back the job it was called on rather than a
+        # configured clone, so anything chained afterwards applies to that same
+        # object. Only do() registers a job, so this builder never reaches the
+        # scheduler.
         builder = every(5).seconds
         assert builder.timezone(tz) is builder
         assert len(schedule.jobs) == 0
-        # timezone() is a configuration method like every other one, so it has to
-        # compose in either direction. Both jobs of each pair are built inside a
-        # single mock_datetime block so they see the very same clock.
+        # timezone() composes in either direction. Both jobs of a pair are built
+        # inside one mock_datetime block so they see the very same clock.
         with mock_datetime(2025, 6, 15, 12, 0, 0, TZ_MADRID):
-            # A seconds unit cannot use at() at all, so this pairing is only
-            # expressible through timezone().
             unit_first = every(5).seconds.timezone(tz).do(mock_job)
             zone_first = every(5).timezone(tz).seconds.do(mock_job)
             self.assertEqual(unit_first.at_time_zone, zone_first.at_time_zone)
             self.assertEqual(unit_first.next_run, zone_first.next_run)
 
-            # A daily job can carry an at_time as well; timezone() must neither
-            # depend on nor disturb it, in either order.
             at_first = every().day.at("10:30").timezone(tz).do(mock_job)
             zone_before_at = every().day.timezone(tz).at("10:30").do(mock_job)
             self.assertEqual(at_first.at_time_zone, zone_before_at.at_time_zone)
@@ -1558,8 +1493,8 @@ class SchedulerTests(TestCase):
         mock_job = self.make_tz_mock_job()
         import pytz
 
-        # at()'s tz argument and timezone() share a single decoder, so they must
-        # produce identical jobs for both of the accepted argument types.
+        # Both accepted argument types, a zone name and a pytz object, must give
+        # the same job whichever entry point supplies them.
         with mock_datetime(2025, 6, 15, 12, 0, 0, TZ_MADRID):
             zone = "Europe/Madrid"
             by_argument = every().day.at("10:30", zone).do(mock_job)
@@ -1578,43 +1513,35 @@ class SchedulerTests(TestCase):
         mock_job = self.make_tz_mock_job()
         import pytz
 
-        # The new entry point must raise exactly what at()'s tz argument raises.
-        # The exception hierarchy is frozen: an unknown zone name still comes
-        # straight from pytz, and a wrong type is still a ScheduleValueError.
+        # An unknown zone name comes straight from pytz, and a wrong argument type
+        # is a ScheduleValueError - the same pair at()'s tz argument raises.
         with self.assertRaises(pytz.exceptions.UnknownTimeZoneError):
             every().day.timezone("FakeZone").do(mock_job)
 
         with self.assertRaises(ScheduleValueError) as context:
             every().day.timezone(43).do(mock_job)
-        # The message is part of the frozen contract, not merely the class: a
-        # ScheduleValueError raised for some other reason - by at()'s unit guard
-        # or one of its anchor-string grammars - would satisfy the class check
-        # while telling the caller something entirely different.
+        # The message is asserted as well, so a ScheduleValueError raised for some
+        # other reason cannot satisfy this test by its class alone.
         assert (
             str(context.exception) == "Timezone must be string or pytz.timezone object"
         )
 
     def test_at_still_rejects_seconds_unit(self):
         mock_job = self.make_tz_mock_job()
-        # at()'s unit guard is deliberately preserved. There is no anchor-string
-        # grammar for a seconds unit, so such a job has nothing legal to pass
-        # at(); timezone() - not a relaxed guard - is how it becomes timezone
-        # aware. Do not "complete" the fix by removing this restriction.
+        # at() rejects a seconds unit outright: no anchor-string grammar exists for
+        # one, so such a job reaches a timezone through timezone() instead.
         with self.assertRaises(ScheduleValueError) as context:
             every(5).seconds.at(":00").do(mock_job)
-        # Pin the guard's own wording, so the assertion cannot be satisfied by a
-        # ScheduleValueError raised further down at() - which would mean the unit
-        # guard had gone and the rejection was coming from somewhere else.
+        # The guard's own wording is asserted, so a ScheduleValueError raised
+        # further down at() cannot satisfy this test in its place.
         assert str(context.exception) == (
             "Invalid unit (valid units are `days`, `hours`, and `minutes`)"
         )
 
     def test_naive_minutes_dst_overlap_hour_unchanged(self):
         mock_job = make_mock_job()
-        # Jobs without a timezone deliberately do not take clock changes into
-        # account, and that must stay true: both the due-check and the scheduling
-        # arithmetic keep their naive branch verbatim. This test uses the plain
-        # make_mock_job(), so it runs - and passes - without pytz installed.
+        # A job without a timezone takes no account of clock changes, and the
+        # plain make_mock_job() lets this test run where pytz is absent.
         with mock_datetime(2025, 10, 26, 2, 58, 40, TZ_MADRID, fold=0):
             # Current local time:   02:58:40
             # Expected next run:    02:59:30
@@ -1624,8 +1551,7 @@ class SchedulerTests(TestCase):
             assert job.next_run.minute == 59
             assert job.next_run.second == 30
         with mock_datetime(2025, 10, 26, 2, 59, 40, TZ_MADRID, fold=0):
-            # A naive job walks the wall clock, so it steps straight to 03:00:30
-            # and skips the repeated hour - exactly as it did before the fix.
+            # A naive job walks the wall clock straight over the repeated hour
             job.run()
             assert job.next_run.hour == 3
             assert job.next_run.minute == 0
@@ -1633,12 +1559,9 @@ class SchedulerTests(TestCase):
         import importlib.util
 
         if importlib.util.find_spec("pytz") is None:
-            # Being the only added test that runs without pytz, this is also the
-            # only place the missing-optional-dependency signal can be asserted.
-            # timezone() must let the ModuleNotFoundError from its lazy import
-            # escape unchanged: translating it into a ScheduleValueError would
-            # look like invalid configuration and hide the real remedy, and no
-            # timezone test could catch that because they all skip here.
+            # Without the optional dependency, timezone() lets the
+            # ModuleNotFoundError from its lazy import escape unchanged: a
+            # ScheduleValueError would read as invalid configuration instead.
             with self.assertRaises(ModuleNotFoundError):
                 every(5).seconds.timezone("Europe/Madrid")
 
